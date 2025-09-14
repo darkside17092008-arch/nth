@@ -1,0 +1,23 @@
+# .cirrus.yml
+# Contoh sederhana membuat file teks "Hello" sebagai artifact
+
+task:
+  name: "Create Hello Text File"
+  container:
+    # Gunakan image Linux sederhana
+    image: ubuntu:22.04
+  
+  # Script untuk membuat file hello
+  create_hello_script:
+    - echo "Hello, World!" > hello.txt
+    - echo "Ini adalah file yang dibuat di Cirrus CI" >> hello.txt
+    - echo "Build ID: $CIRRUS_BUILD_ID" >> hello.txt
+    - echo "Branch: $CIRRUS_BRANCH" >> hello.txt
+    - echo "Timestamp: $(date)" >> hello.txt
+    - ls -la hello.txt
+    - cat hello.txt
+  
+  # Konfigurasi artifacts untuk menyimpan file hello.txt
+  artifacts:
+    hello_file:
+      path: "hello.txt"
