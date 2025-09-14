@@ -14,7 +14,7 @@ env:
   CCACHE_SIZE: 10G
   ALLOW_MISSING_DEPENDENCIES: true
   LC_ALL: C
-  # Optional: set via Cirrus Secrets kalau punya
+  # Optional: set via Cirrus Secrets kalau punya token
   FILEIO_TOKEN: ""
 
 task:
@@ -54,7 +54,7 @@ task:
     apt-get install -y -qq --no-install-recommends \
       rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
       python python3 openjdk-8-jdk-headless ca-certificates wget file make \
-      openssh-client dos2unix > /dev/null 2>&1
+      openssh-client dos2unix jq > /dev/null 2>&1
 
     echo "  Installing repo tool..."
     wget -q https://storage.googleapis.com/git-repo-downloads/repo -O /usr/bin/repo
@@ -93,7 +93,7 @@ task:
     sync_attempts=0
     max_attempts=3
     while [ $sync_attempts -lt $max_attempts ]; do
-      if repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags --optimized-fetch > /dev/null 2>&1; then
+      if repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags --optimized-fetch > /dev/null 2>&1; then
         echo "  Source sync completed"
         break
       else
@@ -480,7 +480,7 @@ task:
     echo "  This will take 15-30 minutes..."
     echo ""
 
-    mka -j$(nproc) bootimage 2>&1 | while IFS= read -r line; do
+    mka -j"$(nproc)" bootimage 2>&1 | while IFS= read -r line; do
       if echo "$line" | grep -qE ".*%.*|^####|^target |^Install:|^Output:|FAILED|error:|ninja:"; then
         echo "$line"
       fi
@@ -493,7 +493,7 @@ task:
     echo "[9/11] Build process completed"
     echo ""
 
-  verify_and_prepare_artifacts_script: |
+  verify_and_prepare_output_script: |
     #!/bin/bash
     set -euo pipefail
 
@@ -525,7 +525,7 @@ task:
 
     cp -f "$OUTPUT_IMG" "$FINAL_PATH"
 
-    # Optional: sertakan fstab ke ZIP
+    # Optional: include recovery.fstab to the ZIP for reference
     if [[ -f "device/infinix/Infinix-X6512/recovery.fstab" ]]; then
       cp -f "device/infinix/Infinix-X6512/recovery.fstab" "$ARTIFACTS_DIR/recovery.fstab"
     fi
@@ -542,66 +542,71 @@ task:
 
   upload_to_fileio_script: |
     #!/bin/bash
-    # Print ONLY download links at the end.
+    # Print ONLY the download links (FILEIO_ZIP=..., FILEIO_IMG=...) at the end.
     set -euo pipefail
 
     ARTIFACTS_DIR="/tmp/artifacts"
     [ -d "$ARTIFACTS_DIR" ] || exit 1
 
-    # Build preferensi: ZIP dulu, lalu IMG
-    get_latest() { ls -1t "$1" 2>/dev/null | head -n1 || true; }
-
-    ZIP_FILE=$(get_latest "$ARTIFACTS_DIR"/*.zip)
-    IMG_FILE=$(get_latest "$ARTIFACTS_DIR"/*.img)
-
-    # Siapkan header auth kalau token ada
-    AUTH_ARGS=()
-    if [ -n "${FILEIO_TOKEN:-}" ]; then
-      AUTH_ARGS=(-H "Authorization: Bearer ${FILEIO_TOKEN}")
-    fi
+    # Pick latest ZIP and IMG if multiple
+    ZIP_FILE="$(ls -1t "$ARTIFACTS_DIR"/*.zip 2>/dev/null | head -n1 || true)"
+    IMG_FILE="$(ls -1t "$ARTIFACTS_DIR"/*.img 2>/dev/null | head -n1 || true)"
 
     upload_fileio() {
       local f="$1"
       [ -f "$f" ] || { echo ""; return 1; }
 
-      # Paksa JSON + preserve POST pada redirect
-      local resp=""
-      resp=$(curl -fsS -L --post301 --post302 --post303 \
-        --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 1200 \
-        -H 'Accept: application/json' \
-        -H 'User-Agent: curl/7.68 (+Cirrus-CI)' \
-        "${AUTH_ARGS[@]}" \
-        -F "file=@${f}" \
-        "https://file.io/?expires=1w" 2>/dev/null || true)
+      local resp_file http_code
+      resp_file="$(mktemp)"
 
-      # Parse JSON aman (fallback regex kalau bukan JSON)
-      python3 - "$resp" <<'PY' || true
-import sys, json, re
-s = sys.argv[1] if len(sys.argv)>1 else sys.stdin.read()
-try:
-  d = json.loads(s)
-  print(d.get("link",""))
-except Exception:
-  m = re.search(r'https?://\S+', s)
-  print(m.group(0) if m else "")
-PY
+      # Build curl args (add token header if present)
+      local curl_args=(
+        -sS -L --http1.1
+        --retry 3 --retry-delay 2
+        --connect-timeout 30 --max-time 1200
+        -H "Accept: application/json"
+        -F "file=@${f}"
+        -F "expires=1w"
+        https://file.io
+        -o "$resp_file" -w "%{http_code}"
+      )
+      if [ -n "${FILEIO_TOKEN:-}" ]; then
+        curl_args=( -H "Authorization: Bearer ${FILEIO_TOKEN}" "${curl_args[@]}" )
+      fi
+
+      # Do upload
+      http_code="$(curl "${curl_args[@]}")" || http_code="000"
+
+      # Parse JSON safely with jq; fallback to regex if not JSON
+      local link=""
+      if [ "$http_code" = "200" ]; then
+        set +e
+        link="$(jq -r '.link // empty' < "$resp_file" 2>/dev/null)"
+        set -e
+      fi
+      if [ -z "$link" ]; then
+        link="$(grep -oE 'https?://[^" ]+' "$resp_file" | head -n1 || true)"
+      fi
+
+      rm -f "$resp_file"
+      printf '%s' "$link"
     }
 
     LINK_ZIP=""
     LINK_IMG=""
 
     if [ -n "${ZIP_FILE:-}" ]; then
-      LINK_ZIP="$(upload_fileio "$ZIP_FILE" | tr -d '\r' | tail -n1)"
+      LINK_ZIP="$(upload_fileio "$ZIP_FILE")"
     fi
     if [ -n "${IMG_FILE:-}" ]; then
-      LINK_IMG="$(upload_fileio "$IMG_FILE" | tr -d '\r' | tail -n1)"
+      LINK_IMG="$(upload_fileio "$IMG_FILE")"
     fi
 
-    # Print link saja, tanpa noise
+    # Print ONLY the links
     [ -n "$LINK_ZIP" ] && echo "FILEIO_ZIP=$LINK_ZIP"
     [ -n "$LINK_IMG" ] && echo "FILEIO_IMG=$LINK_IMG"
 
-    # Kalau keduanya kosong, fail biar ketahuan
+    # Fail if both empty
     if [ -z "$LINK_ZIP" ] && [ -z "$LINK_IMG" ]; then
       exit 1
     fi
